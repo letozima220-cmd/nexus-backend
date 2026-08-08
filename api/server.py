@@ -1,6 +1,6 @@
 """
 Nexus MCP Backend — production API for nexus-frontend.
-In-process demo tools (weather, booking, geo, content) + optional Grok.
+In-process demo tools + Groq / Grok free LLM.
 """
 from __future__ import annotations
 
@@ -17,7 +17,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse
 from pydantic import BaseModel, Field
 
-app = FastAPI(title="Nexus MCP Backend", version="1.1.0")
+app = FastAPI(title="Nexus MCP Backend", version="1.2.0")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -226,7 +226,9 @@ async def call_tool(server_id: str, name: str, args: dict | None = None) -> Any:
         elif server_id == "local-booking" and name == "book_service":
             out = tool_book(args.get("business_id", "b1"), args.get("service", "услуга"), args.get("slot", "15:00"), args.get("customer_name", "Гость"))
         elif server_id == "local-booking" and name == "list_my_bookings":
-            out = "Броней пока нет." if not _bookings else "\n".join(f"• {b['id']}: {b['business']} — {b['service']} в {b['slot']}" for b in _bookings)
+            out = "Броней пока нет." if not _bookings else "\n".join(
+                f"• {b['id']}: {b['business']} — {b['service']} в {b['slot']}" for b in _bookings
+            )
         elif server_id == "local-booking" and name == "order_food_demo":
             out = f"🍽 Демо-заказ принят: «{args.get('dish', 'суши')}» → {args.get('address', 'домой')}.\nВ продакшене — API доставки."
         elif server_id == "local-booking" and name == "call_taxi_demo":
@@ -266,6 +268,70 @@ class ChatResponse(BaseModel):
     tools_used: list[dict[str, Any]] = []
 
 
+async def call_free_llm(msg: str) -> str | None:
+    """Groq / OpenRouter when no Grok key."""
+    provider = (os.getenv("LLM_PROVIDER") or "groq").lower().strip()
+    system = (
+        "Ты Nexus — ИИ-агент для жизни и бизнеса в России. "
+        "Отвечай кратко и по делу на русском. "
+        "Умеешь: погода, бронь салонов, такси, еда, слоганы, поиск мест. "
+        "Если просят конкретное действие (погода/бронь/такси) — ответь полезно и коротко."
+    )
+
+    groq_key = (os.getenv("GROQ_API_KEY") or "").strip()
+    if provider in ("groq", "auto") and groq_key:
+        try:
+            async with httpx.AsyncClient(timeout=45.0) as client:
+                r = await client.post(
+                    "https://api.groq.com/openai/v1/chat/completions",
+                    headers={
+                        "Authorization": f"Bearer {groq_key}",
+                        "Content-Type": "application/json",
+                    },
+                    json={
+                        "model": os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile"),
+                        "messages": [
+                            {"role": "system", "content": system},
+                            {"role": "user", "content": msg},
+                        ],
+                        "temperature": 0.4,
+                    },
+                )
+                if r.status_code < 400:
+                    data = r.json()
+                    text = ((data.get("choices") or [{}])[0].get("message") or {}).get("content") or ""
+                    return text.strip() or None
+        except Exception:
+            pass
+
+    or_key = (os.getenv("OPENROUTER_API_KEY") or "").strip()
+    if provider in ("openrouter", "auto") and or_key:
+        try:
+            async with httpx.AsyncClient(timeout=45.0) as client:
+                r = await client.post(
+                    "https://openrouter.ai/api/v1/chat/completions",
+                    headers={
+                        "Authorization": f"Bearer {or_key}",
+                        "Content-Type": "application/json",
+                    },
+                    json={
+                        "model": os.getenv("OPENROUTER_MODEL", "meta-llama/llama-3.1-8b-instruct:free"),
+                        "messages": [
+                            {"role": "system", "content": system},
+                            {"role": "user", "content": msg},
+                        ],
+                    },
+                )
+                if r.status_code < 400:
+                    data = r.json()
+                    text = ((data.get("choices") or [{}])[0].get("message") or {}).get("content") or ""
+                    return text.strip() or None
+        except Exception:
+            pass
+
+    return None
+
+
 async def run_keyword_agent(msg: str) -> tuple[str, list[dict]]:
     lower = msg.lower()
     reply_parts: list[str] = []
@@ -273,7 +339,11 @@ async def run_keyword_agent(msg: str) -> tuple[str, list[dict]]:
 
     if any(w in lower for w in ("погод", "weather", "температур")):
         city = "Moscow"
-        cities = {"москв": "Moscow", "moscow": "Moscow", "лондон": "London", "london": "London", "токио": "Tokyo", "tokyo": "Tokyo", "берлин": "Berlin", "berlin": "Berlin", "петербург": "СПб", "спб": "СПб"}
+        cities = {
+            "москв": "Moscow", "moscow": "Moscow", "лондон": "London", "london": "London",
+            "токио": "Tokyo", "tokyo": "Tokyo", "берлин": "Berlin", "berlin": "Berlin",
+            "петербург": "СПб", "спб": "СПб",
+        }
         for k, v in cities.items():
             if k in lower:
                 city = v
@@ -320,7 +390,10 @@ async def run_keyword_agent(msg: str) -> tuple[str, list[dict]]:
         except Exception as e:
             reply_parts.append(f"❌ Гео: {e}")
 
-    life_words = ("маникюр", "педикюр", "салон", "стрижк", "барбер", "ресторан", "столик", "заброн", "такси", "суши", "еду", "еда", "бронь", "записи", "пицц")
+    life_words = (
+        "маникюр", "педикюр", "салон", "стрижк", "барбер", "ресторан", "столик",
+        "заброн", "такси", "суши", "еду", "еда", "бронь", "записи", "пицц",
+    )
     if any(w in lower for w in life_words):
         ensure_connected("local-booking")
         try:
@@ -342,7 +415,11 @@ async def run_keyword_agent(msg: str) -> tuple[str, list[dict]]:
                 reply_parts.append(text)
                 tools_used.append({"server_id": "local-booking", "name": "list_my_bookings", "ok": True})
             else:
-                q = "маникюр" if any(w in lower for w in ("маникюр", "педикюр")) else ("стрижка" if any(w in lower for w in ("стрижк", "барбер")) else ("ресторан" if any(w in lower for w in ("ресторан", "столик")) else msg[:80]))
+                q = (
+                    "маникюр" if any(w in lower for w in ("маникюр", "педикюр"))
+                    else ("стрижка" if any(w in lower for w in ("стрижк", "барбер"))
+                          else ("ресторан" if any(w in lower for w in ("ресторан", "столик")) else msg[:80]))
+                )
                 text = await call_tool("local-booking", "search_business", {"query": q, "city": "Москва"})
                 reply_parts.append(text)
                 reply_parts.append("\n\nЧтобы забронировать: «забронируй b1 маникюр 15:00».")
@@ -352,7 +429,10 @@ async def run_keyword_agent(msg: str) -> tuple[str, list[dict]]:
                     bid = m_book.group(1) if m_book else "b1"
                     slot = m_book.group(2) if m_book else "15:00"
                     svc = "маникюр" if "маникюр" in lower else ("стрижка" if "стрижк" in lower else "услуга")
-                    text2 = await call_tool("local-booking", "book_service", {"business_id": bid, "service": svc, "slot": slot})
+                    text2 = await call_tool(
+                        "local-booking", "book_service",
+                        {"business_id": bid, "service": svc, "slot": slot},
+                    )
                     reply_parts.append("\n" + text2)
                     tools_used.append({"server_id": "local-booking", "name": "book_service", "ok": True})
         except Exception as e:
@@ -360,9 +440,14 @@ async def run_keyword_agent(msg: str) -> tuple[str, list[dict]]:
 
     if not reply_parts:
         connected = list(_connected.values())
-        lines = [f"• {c['name']}: {', '.join(c['tools'])}" for c in connected] or ["• пока нет коннекторов — нажмите ✦ Демо"]
+        lines = [f"• {c['name']}: {', '.join(c['tools'])}" for c in connected] or [
+            "• пока нет коннекторов — нажмите ✦ Демо"
+        ]
         reply_parts.append("Я Nexus MCP Agent.\n" + "\n".join(lines))
-        reply_parts.append("\n\nПопробуйте:\n• «Какая погода в Токио?»\n• «Сгенерируй слоган для эко-кофе»\n• «Найди маникюр с рейтингом от 4.5»\n• «Закажи такси домой»\n\n💡 Добавьте Grok API key в Настройках.")
+        reply_parts.append(
+            "\n\nПопробуйте:\n• «Какая погода в Токио?»\n• «Сгенерируй слоган для эко-кофе»\n"
+            "• «Найди маникюр с рейтингом от 4.5»\n• «Закажи такси домой»"
+        )
 
     return "\n".join(reply_parts), tools_used
 
@@ -374,7 +459,14 @@ async def run_grok_agent(msg: str, api_key: str) -> tuple[str, list[dict]] | Non
             r = await client.post(
                 "https://api.x.ai/v1/chat/completions",
                 headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
-                json={"model": os.getenv("GROK_MODEL", "grok-2-latest"), "messages": [{"role": "system", "content": system}, {"role": "user", "content": msg}], "temperature": 0.4},
+                json={
+                    "model": os.getenv("GROK_MODEL", "grok-2-latest"),
+                    "messages": [
+                        {"role": "system", "content": system},
+                        {"role": "user", "content": msg},
+                    ],
+                    "temperature": 0.4,
+                },
             )
             if r.status_code >= 400:
                 return None
@@ -383,9 +475,6 @@ async def run_grok_agent(msg: str, api_key: str) -> tuple[str, list[dict]] | Non
             text = text.strip()
             if not text:
                 return None
-            kw_reply, tools = await run_keyword_agent(msg)
-            if tools:
-                return f"{text}\n\n---\n{kw_reply}", tools
             return text, []
     except Exception:
         return None
@@ -396,14 +485,24 @@ async def root():
     return """<!DOCTYPE html><html><head><title>Nexus MCP</title>
     <style>body{font-family:system-ui;background:#0a0a0a;color:#fff;text-align:center;padding:50px}
     h1{color:#00ff88}</style></head><body>
-    <h1>Nexus MCP Backend</h1><p style="color:#00ff88">Сервер работает · v1.1.0</p>
+    <h1>Nexus MCP Backend</h1><p style="color:#00ff88">Сервер работает · v1.2.0</p>
     <p><a href="/docs" style="color:#7dd3fc">/docs</a> · <a href="/api/health" style="color:#7dd3fc">/api/health</a></p>
     </body></html>"""
 
 
 @app.get("/api/health")
 async def health():
-    return {"status": "ok", "ok": True, "service": "nexus-mcp", "version": "1.1.0", "connected": list(_connected.keys())}
+    llm = (os.getenv("LLM_PROVIDER") or "groq").lower()
+    has_groq = bool((os.getenv("GROQ_API_KEY") or "").strip())
+    return {
+        "status": "ok",
+        "ok": True,
+        "service": "nexus-mcp",
+        "version": "1.2.0",
+        "connected": list(_connected.keys()),
+        "llm_provider": llm,
+        "groq_configured": has_groq,
+    }
 
 
 @app.get("/api/servers")
@@ -418,7 +517,16 @@ async def catalog():
 
 @app.get("/api/connected")
 async def list_connected():
-    return [{"id": c["id"], "name": c["name"], "tools_count": len(c["tools"]), "tools": c["tools"], "price_cents": c.get("price_cents", 0)} for c in _connected.values()]
+    return [
+        {
+            "id": c["id"],
+            "name": c["name"],
+            "tools_count": len(c["tools"]),
+            "tools": c["tools"],
+            "price_cents": c.get("price_cents", 0),
+        }
+        for c in _connected.values()
+    ]
 
 
 @app.get("/api/tools")
@@ -455,20 +563,34 @@ async def chat(req: ChatRequest):
     msg = req.message.strip()
     if not msg:
         raise HTTPException(400, "Пустое сообщение")
+
     grok_key = (_settings.get("grok_api_key") or "").strip() or os.getenv("GROK_API_KEY", "")
     tools_used: list[dict] = []
-    if grok_key:
-        actionable = any(w in msg.lower() for w in ("погод", "weather", "слоган", "маникюр", "такси", "суши", "салон", "ресторан", "бронь", "найди", "рейтинг", "стрижк"))
-        if actionable:
-            reply, tools_used = await run_keyword_agent(msg)
-        else:
+
+    actionable = any(
+        w in msg.lower()
+        for w in (
+            "погод", "weather", "слоган", "маникюр", "такси", "суши",
+            "салон", "ресторан", "бронь", "найди", "рейтинг", "стрижк",
+            "еду", "еда", "пицц", "генерир",
+        )
+    )
+
+    if actionable:
+        reply, tools_used = await run_keyword_agent(msg)
+    else:
+        reply = None
+        if grok_key:
             grok = await run_grok_agent(msg, grok_key)
             if grok:
                 reply, tools_used = grok
-            else:
-                reply, tools_used = await run_keyword_agent(msg)
-    else:
-        reply, tools_used = await run_keyword_agent(msg)
+        if not reply:
+            free = await call_free_llm(msg)
+            if free:
+                reply = free
+        if not reply:
+            reply, tools_used = await run_keyword_agent(msg)
+
     _history.append({"role": "user", "content": msg, "ts": time.time()})
     _history.append({"role": "assistant", "content": reply, "ts": time.time(), "tools": tools_used})
     return ChatResponse(reply=reply, tools_used=tools_used)
