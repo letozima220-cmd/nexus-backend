@@ -1,4 +1,4 @@
- """
+""""""""
 Nexus MCP Backend — production API for nexus-frontend.
 In-process demo tools (weather, booking, geo, content) + optional Grok.
 """
