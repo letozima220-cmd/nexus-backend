@@ -1,10 +1,9 @@
 """
-Nexus MCP Backend v1.3.0
-- Demo tools (weather, geo, booking, content)
-- Supabase persistence (history, bookings, business, settings, usage)
-- Notion connector
-- Multi-LLM: groq / grok / openrouter + chat switch
-- Keys only from env
+Nexus MCP Backend v2.0.0
+- OpenRouter-first LLM
+- Structured chat responses for rich animated UI
+- Supabase + Notion + multi-provider fallback
+- request_id, latency_ms, cards, ui hints
 """
 from __future__ import annotations
 
@@ -13,15 +12,17 @@ import os
 import re
 import secrets
 import time
+import uuid
+from collections import defaultdict, deque
 from typing import Any
 
 import httpx
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse
 from pydantic import BaseModel, Field
 
-APP_VERSION = "1.3.0"
+APP_VERSION = "2.0.0"
 USER_ID = "web_user"
 
 app = FastAPI(title="Nexus MCP Backend", version=APP_VERSION)
@@ -33,35 +34,53 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-
+# ---------- env ----------
 def env(name: str, default: str = "") -> str:
     return (os.getenv(name) or default).strip()
 
 
+# ---------- rate limit (in-memory; swap Redis later) ----------
+_rl: dict[str, deque] = defaultdict(deque)
+RL_MAX = int(env("RATE_LIMIT_PER_MIN", "60") or "60")
+
+
+def rate_ok(key: str) -> bool:
+    now = time.time()
+    q = _rl[key]
+    while q and now - q[0] > 60:
+        q.popleft()
+    if len(q) >= RL_MAX:
+        return False
+    q.append(now)
+    return True
+
+
+# ---------- catalog ----------
 SERVERS = [
-    {"id": "weather", "name": "Weather Demo", "description": "Погода по городу — демо", "category": "demo", "icon": "🌤", "price_cents_per_call": 0},
-    {"id": "paid-tools", "name": "AI Content Tools", "description": "Слоганы, тональность", "category": "content", "icon": "✨", "price_cents_per_call": 5},
-    {"id": "local-booking", "name": "Локальный бизнес", "description": "Бронь салонов, такси, еда", "category": "lifestyle", "icon": "🏪", "price_cents_per_call": 0},
-    {"id": "geo-ru", "name": "Гео-поиск РФ", "description": "Лучшие места по отзывам", "category": "geo", "icon": "🗺", "price_cents_per_call": 0},
-    {"id": "notion", "name": "Notion", "description": "База знаний и записи в database", "category": "productivity", "icon": "📓", "price_cents_per_call": 0},
+    {"id": "weather", "name": "Weather", "description": "Погода по городу", "category": "demo", "icon": "🌤", "price_cents_per_call": 0},
+    {"id": "paid-tools", "name": "AI Content", "description": "Слоганы, тональность", "category": "content", "icon": "✨", "price_cents_per_call": 5},
+    {"id": "local-booking", "name": "Локальный бизнес", "description": "Бронь, такси, еда", "category": "lifestyle", "icon": "🏪", "price_cents_per_call": 0},
+    {"id": "geo-ru", "name": "Гео РФ", "description": "Места по отзывам", "category": "geo", "icon": "🗺", "price_cents_per_call": 0},
+    {"id": "notion", "name": "Notion", "description": "База знаний", "category": "productivity", "icon": "📓", "price_cents_per_call": 0},
 ]
 
 PRESETS = [
-    {"id": "canva", "name": "Canva", "description": "Дизайн (OAuth позже)", "category": "design", "icon": "🎨", "auth": "oauth"},
-    {"id": "telegram", "name": "Telegram", "description": "Бот (token позже)", "category": "smm", "icon": "✈️", "auth": "bot_token"},
+    {"id": "canva", "name": "Canva", "description": "Дизайн", "category": "design", "icon": "🎨", "auth": "oauth"},
+    {"id": "telegram", "name": "Telegram", "description": "Бот", "category": "smm", "icon": "✈️", "auth": "bot_token"},
     {"id": "n8n", "name": "n8n", "description": "Автоматизации", "category": "automation", "icon": "🔄", "auth": "api_key"},
+    {"id": "google-calendar", "name": "Google Calendar", "description": "Календарь", "category": "productivity", "icon": "📅", "auth": "oauth"},
 ]
 
 PACKS = [
     {"id": "lifestyle-home", "name": "Бытовая польза", "description": "Еда, такси, салоны", "icon": "🏠", "connectors": ["local-booking", "geo-ru"]},
-    {"id": "smm-starter", "name": "SMM Starter", "description": "Контент и сторис", "icon": "✨", "connectors": ["paid-tools", "notion"]},
-    {"id": "knowledge", "name": "База знаний", "description": "Notion + контент", "icon": "📚", "connectors": ["notion", "paid-tools"]},
+    {"id": "smm-starter", "name": "SMM Starter", "description": "Контент", "icon": "✨", "connectors": ["paid-tools", "notion"]},
+    {"id": "knowledge", "name": "База знаний", "description": "Notion + AI", "icon": "📚", "connectors": ["notion", "paid-tools"]},
 ]
 
 PLANS = [
-    {"id": "free", "name": "Старт", "price": "0 ₽", "price_rub": 0, "features": ["Демо-коннекторы", "Чат", "Бытовая польза"]},
-    {"id": "creator", "name": "Creator", "price": "990 ₽", "price_rub": 990, "featured": True, "features": ["LLM на выбор", "Notion", "Сценарии"]},
-    {"id": "business", "name": "Business", "price": "2990 ₽", "price_rub": 2990, "features": ["Команда", "Supabase", "Приоритет"]},
+    {"id": "free", "name": "Старт", "price": "0 ₽", "price_rub": 0, "features": ["Чат", "Демо tools", "OpenRouter/Groq"]},
+    {"id": "creator", "name": "Creator", "price": "990 ₽", "price_rub": 990, "featured": True, "features": ["Больше лимитов", "Notion", "Сценарии"]},
+    {"id": "business", "name": "Business", "price": "2990 ₽", "price_rub": 2990, "features": ["Команда", "Приоритет", "Каталог"]},
 ]
 
 BUSINESSES = [
@@ -80,16 +99,19 @@ GEO_PLACES = [
 ]
 
 WEATHER = {
-    "moscow": "Москва: -5°C, снег, влажность 80%",
-    "москва": "Москва: -5°C, снег, влажность 80%",
-    "london": "London: 8°C, cloudy, humidity 70%",
-    "лондон": "London: 8°C, cloudy, humidity 70%",
-    "tokyo": "Tokyo: 18°C, sunny, humidity 55%",
-    "токио": "Tokyo: 18°C, sunny, humidity 55%",
-    "berlin": "Berlin: 12°C, rain, humidity 85%",
-    "берлин": "Berlin: 12°C, rain, humidity 85%",
-    "спб": "Санкт-Петербург: 2°C, облачно, влажность 75%",
-    "петербург": "Санкт-Петербург: 2°C, облачно, влажность 75%",
+    "moscow": ("Москва", -5, "снег", 80),
+    "москва": ("Москва", -5, "снег", 80),
+    "питер": ("Санкт-Петербург", 2, "облачно", 75),
+    "питере": ("Санкт-Петербург", 2, "облачно", 75),
+    "спб": ("Санкт-Петербург", 2, "облачно", 75),
+    "петербург": ("Санкт-Петербург", 2, "облачно", 75),
+    "санкт": ("Санкт-Петербург", 2, "облачно", 75),
+    "london": ("London", 8, "cloudy", 70),
+    "лондон": ("London", 8, "cloudy", 70),
+    "tokyo": ("Tokyo", 18, "sunny", 55),
+    "токио": ("Tokyo", 18, "sunny", 55),
+    "berlin": ("Berlin", 12, "rain", 85),
+    "берлин": ("Berlin", 12, "rain", 85),
 }
 
 SERVER_META = {s["id"]: s for s in SERVERS}
@@ -111,13 +133,22 @@ _settings: dict[str, Any] = {
     "demo_mode": True,
     "display_name": "Demo User",
     "onboarding_done": False,
-    "llm_provider": env("LLM_PROVIDER", "groq") or "groq",
+    "llm_provider": env("LLM_PROVIDER", "openrouter") or "openrouter",
 }
 _auth_codes: dict[str, str] = {}
 _sessions: dict[str, dict] = {}
 _history: list[dict] = []
+_http: httpx.AsyncClient | None = None
 
 
+async def http() -> httpx.AsyncClient:
+    global _http
+    if _http is None or _http.is_closed:
+        _http = httpx.AsyncClient(timeout=httpx.Timeout(45.0, connect=10.0))
+    return _http
+
+
+# ---------- Supabase ----------
 class Supa:
     def __init__(self) -> None:
         self.url = env("SUPABASE_URL").rstrip("/")
@@ -136,9 +167,9 @@ class Supa:
         if not self.ok:
             return False
         try:
-            async with httpx.AsyncClient(timeout=12.0) as client:
-                r = await client.post(f"{self.url}/rest/v1/{table}", headers=self._headers(), json=row)
-                return r.status_code < 300
+            c = await http()
+            r = await c.post(f"{self.url}/rest/v1/{table}", headers=self._headers(), json=row)
+            return r.status_code < 300
         except Exception:
             return False
 
@@ -148,13 +179,9 @@ class Supa:
         try:
             headers = self._headers()
             headers["Prefer"] = "resolution=merge-duplicates,return=representation"
-            async with httpx.AsyncClient(timeout=12.0) as client:
-                r = await client.post(
-                    f"{self.url}/rest/v1/{table}?on_conflict={on_conflict}",
-                    headers=headers,
-                    json=row,
-                )
-                return r.status_code < 300
+            c = await http()
+            r = await c.post(f"{self.url}/rest/v1/{table}?on_conflict={on_conflict}", headers=headers, json=row)
+            return r.status_code < 300
         except Exception:
             return False
 
@@ -162,12 +189,12 @@ class Supa:
         if not self.ok:
             return []
         try:
-            async with httpx.AsyncClient(timeout=12.0) as client:
-                r = await client.get(f"{self.url}/rest/v1/{table}?{query}", headers=self._headers())
-                if r.status_code >= 400:
-                    return []
-                data = r.json()
-                return data if isinstance(data, list) else []
+            c = await http()
+            r = await c.get(f"{self.url}/rest/v1/{table}?{query}", headers=self._headers())
+            if r.status_code >= 400:
+                return []
+            data = r.json()
+            return data if isinstance(data, list) else []
         except Exception:
             return []
 
@@ -186,27 +213,14 @@ async def persist_message(role: str, content: str, tools: list | None = None) ->
 async def persist_booking(b: dict) -> None:
     await supa.insert(
         "bookings",
-        {
-            "id": b["id"],
-            "user_id": USER_ID,
-            "business": b["business"],
-            "service": b["service"],
-            "slot": b["slot"],
-            "customer": b.get("customer", "Гость"),
-        },
+        {"id": b["id"], "user_id": USER_ID, "business": b["business"], "service": b["service"], "slot": b["slot"], "customer": b.get("customer", "Гость")},
     )
 
 
 async def persist_usage(server_id: str, tool: str, ok: bool, cents: int = 0) -> None:
     await supa.insert(
         "usage_events",
-        {
-            "user_id": USER_ID,
-            "server_id": server_id,
-            "tool_name": tool,
-            "success": ok,
-            "price_cents": cents if ok else 0,
-        },
+        {"user_id": USER_ID, "server_id": server_id, "tool_name": tool, "success": ok, "price_cents": cents if ok else 0},
     )
 
 
@@ -226,7 +240,7 @@ async def save_settings_to_db() -> None:
             "user_id": USER_ID,
             "display_name": _settings.get("display_name"),
             "plan_id": _settings.get("plan_id"),
-            "llm_provider": _settings.get("llm_provider", "groq"),
+            "llm_provider": _settings.get("llm_provider", "openrouter"),
             "demo_mode": _settings.get("demo_mode", True),
             "onboarding_done": _settings.get("onboarding_done", False),
             "updated_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
@@ -234,188 +248,119 @@ async def save_settings_to_db() -> None:
     )
 
 
-def tool_weather(city: str) -> str:
+# ---------- tools ----------
+def weather_payload(city: str) -> dict:
     key = (city or "Moscow").lower().strip()
     for k, v in WEATHER.items():
         if k in key or key in k:
-            return v
-    return f"{city}: 15°C, partly cloudy (демо-данные)"
+            name, temp, cond, hum = v
+            return {"city": name, "temp_c": temp, "condition": cond, "humidity": hum, "source": "demo"}
+    return {"city": city, "temp_c": 15, "condition": "partly cloudy", "humidity": 60, "source": "demo"}
 
 
 def tool_slogan(product: str, tone: str = "professional") -> str:
     templates = {
         "professional": f"{product} — надёжное решение для вашего бизнеса.",
-        "funny": f"{product}? Да это же огонь! Бери, пока не разобрали.",
-        "emotional": f"С {product} жизнь становится ярче. Почувствуй разницу.",
-        "luxury": f"{product}. Когда совершенство — единственный стандарт.",
+        "funny": f"{product}? Да это же огонь!",
+        "emotional": f"С {product} жизнь становится ярче.",
+        "luxury": f"{product}. Когда совершенство — стандарт.",
     }
     return templates.get(tone, templates["professional"])
 
 
-def tool_sentiment(text: str) -> dict:
-    positive = ["хорошо", "отлично", "супер", "люблю", "great", "awesome", "love"]
-    negative = ["плохо", "ужас", "ненавижу", "bad", "hate", "terrible"]
-    tl = text.lower()
-    pos = sum(1 for w in positive if w in tl)
-    neg = sum(1 for w in negative if w in tl)
-    if pos > neg:
-        return {"label": "positive", "score": 0.8}
-    if neg > pos:
-        return {"label": "negative", "score": 0.8}
-    return {"label": "neutral", "score": 0.5}
-
-
-def tool_search_business(query: str = "", city: str = "Москва") -> str:
+def tool_search_business(query: str = "", city: str = "Москва") -> list[dict]:
     q = (query or "").lower()
-    results = []
+    out = []
     for b in BUSINESSES:
         if city and city.lower() not in b["city"].lower():
             continue
         blob = (b["name"] + " " + b["type"] + " " + " ".join(b["services"])).lower()
         if q and q not in blob:
             continue
-        results.append(b)
-    if not results:
-        results = [b for b in BUSINESSES if not city or city.lower() in b["city"].lower()][:5]
-    lines = []
-    for b in results[:8]:
-        lines.append(
-            f"• {b['name']} ({b['type']}) — {b['city']}\n"
-            f"  Услуги: {', '.join(b['services'])}\n"
-            f"  Слоты: {', '.join(b['slots'])} · id={b['id']}"
-        )
-    return "Найдено:\n" + "\n".join(lines) if lines else "Ничего не найдено."
+        out.append(b)
+    return out or [b for b in BUSINESSES if city.lower() in b["city"].lower()][:5]
 
 
-async def tool_book(business_id: str, service: str, slot: str, customer: str = "Гость") -> str:
+async def tool_book(business_id: str, service: str, slot: str, customer: str = "Гость") -> dict:
     b = next((x for x in BUSINESSES if x["id"] == business_id), None)
     if not b:
-        return f"Бизнес {business_id} не найден."
+        return {"ok": False, "error": f"Бизнес {business_id} не найден"}
     if slot not in b["slots"]:
-        return f"Слот {slot} недоступен. Доступны: {', '.join(b['slots'])}"
-    booking = {
-        "id": f"bk{len(_bookings)+1}",
-        "business": b["name"],
-        "service": service,
-        "slot": slot,
-        "customer": customer,
-    }
+        return {"ok": False, "error": f"Слот {slot} недоступен", "slots": b["slots"]}
+    booking = {"id": f"bk{len(_bookings)+1}", "business": b["name"], "service": service, "slot": slot, "customer": customer}
     _bookings.append(booking)
     await persist_booking(booking)
-    return (
-        f"✅ Бронь подтверждена\n• {b['name']}\n• Услуга: {service}\n"
-        f"• Время: {slot}\n• На имя: {customer}\n• Код: {booking['id']}"
-    )
+    return {"ok": True, **booking}
 
 
-def tool_geo(query: str, city: str = "Москва", min_rating: float = 4.5) -> str:
+def tool_geo(query: str, city: str = "Москва", min_rating: float = 4.5) -> list[dict]:
     q = (query or "").lower()
     results = []
     for p in GEO_PLACES:
         if city and city.lower() not in p["city"].lower():
             continue
         blob = (p["name"] + " " + p["category"] + " " + " ".join(p["services"])).lower()
-        if q and not any(tok in blob for tok in q.split() if len(tok) > 2):
-            if q not in blob:
-                continue
+        if q and not any(tok in blob for tok in q.split() if len(tok) > 2) and q not in blob:
+            continue
         if p.get("rating", 0) < min_rating:
             continue
         results.append(p)
     results = sorted(results, key=lambda x: (x.get("rating", 0), x.get("reviews", 0)), reverse=True)[:5]
-    if not results:
-        results = sorted(GEO_PLACES, key=lambda x: x.get("rating", 0), reverse=True)[:5]
-    lines = [f"Топ по отзывам ({city}), мин. рейтинг {min_rating}:"]
-    for i, p in enumerate(results, 1):
-        lines.append(
-            f"{i}. {p['name']} ★{p['rating']} ({p['reviews']} отзывов)\n"
-            f"   {p['address']} · id={p['id']}\n"
-            f"   Услуги: {', '.join(p['services'])}"
-        )
-    lines.append("\nЧтобы забронировать: «забронируй b1 маникюр 15:00».")
-    return "\n".join(lines)
+    return results or sorted(GEO_PLACES, key=lambda x: x.get("rating", 0), reverse=True)[:5]
 
 
 async def tool_notion_search(query: str = "") -> str:
     key = env("NOTION_API_KEY")
     if not key:
-        return "Notion не настроен: добавьте NOTION_API_KEY в Railway Variables."
+        return "Notion: нет NOTION_API_KEY"
     try:
-        async with httpx.AsyncClient(timeout=20.0) as client:
-            r = await client.post(
-                "https://api.notion.com/v1/search",
-                headers={
-                    "Authorization": f"Bearer {key}",
-                    "Notion-Version": "2022-06-28",
-                    "Content-Type": "application/json",
-                },
-                json={"query": query or "", "page_size": 5},
-            )
-            if r.status_code >= 400:
-                return f"Notion error {r.status_code}: {r.text[:200]}"
-            data = r.json()
-            lines = ["Notion — найдено:"]
-            for item in data.get("results") or []:
-                title = "Без названия"
-                props = item.get("properties") or {}
-                for v in props.values():
-                    if v.get("type") == "title":
-                        arr = v.get("title") or []
-                        if arr:
-                            title = arr[0].get("plain_text") or title
-                        break
-                if item.get("object") == "page" and item.get("id"):
-                    lines.append(f"• {title} ({item.get('id')[:8]}…)")
-            return "\n".join(lines) if len(lines) > 1 else "Ничего не найдено в Notion."
+        c = await http()
+        r = await c.post(
+            "https://api.notion.com/v1/search",
+            headers={"Authorization": f"Bearer {key}", "Notion-Version": "2022-06-28", "Content-Type": "application/json"},
+            json={"query": query or "", "page_size": 5},
+        )
+        if r.status_code >= 400:
+            return f"Notion error {r.status_code}"
+        lines = ["Notion:"]
+        for item in (r.json().get("results") or []):
+            title = "Без названия"
+            for v in (item.get("properties") or {}).values():
+                if v.get("type") == "title" and v.get("title"):
+                    title = v["title"][0].get("plain_text") or title
+                    break
+            lines.append(f"• {title}")
+        return "\n".join(lines) if len(lines) > 1 else "Пусто в Notion"
     except Exception as e:
         return f"Notion: {e}"
 
 
 async def tool_notion_add_row(title: str, note: str = "") -> str:
-    key = env("NOTION_API_KEY")
-    db = env("NOTION_DATABASE_ID")
+    key, db = env("NOTION_API_KEY"), env("NOTION_DATABASE_ID")
     if not key or not db:
-        return "Нужны NOTION_API_KEY и NOTION_DATABASE_ID в Railway."
-    payload = {
-        "parent": {"database_id": db},
-        "properties": {
-            "Name": {"title": [{"text": {"content": title or "Nexus note"}}]},
-        },
-    }
+        return "Нужны NOTION_API_KEY и NOTION_DATABASE_ID"
+    payload = {"parent": {"database_id": db}, "properties": {"Name": {"title": [{"text": {"content": title or "Nexus"}}]}}}
     if note:
-        payload["children"] = [
-            {
-                "object": "block",
-                "type": "paragraph",
-                "paragraph": {"rich_text": [{"type": "text", "text": {"content": note[:1800]}}]},
-            }
-        ]
+        payload["children"] = [{"object": "block", "type": "paragraph", "paragraph": {"rich_text": [{"type": "text", "text": {"content": note[:1800]}}]}}]
     try:
-        async with httpx.AsyncClient(timeout=20.0) as client:
-            r = await client.post(
+        c = await http()
+        r = await c.post(
+            "https://api.notion.com/v1/pages",
+            headers={"Authorization": f"Bearer {key}", "Notion-Version": "2022-06-28", "Content-Type": "application/json"},
+            json=payload,
+        )
+        if r.status_code >= 400:
+            payload["properties"] = {"Title": {"title": [{"text": {"content": title or "Nexus"}}]}}
+            r = await c.post(
                 "https://api.notion.com/v1/pages",
-                headers={
-                    "Authorization": f"Bearer {key}",
-                    "Notion-Version": "2022-06-28",
-                    "Content-Type": "application/json",
-                },
+                headers={"Authorization": f"Bearer {key}", "Notion-Version": "2022-06-28", "Content-Type": "application/json"},
                 json=payload,
             )
-            if r.status_code >= 400:
-                payload["properties"] = {"Title": {"title": [{"text": {"content": title or "Nexus note"}}]}}
-                r = await client.post(
-                    "https://api.notion.com/v1/pages",
-                    headers={
-                        "Authorization": f"Bearer {key}",
-                        "Notion-Version": "2022-06-28",
-                        "Content-Type": "application/json",
-                    },
-                    json=payload,
-                )
-            if r.status_code >= 400:
-                return f"Notion write error {r.status_code}: проверьте имя title-свойства в database."
-            return f"✅ Запись добавлена в Notion: «{title}»"
+        if r.status_code >= 400:
+            return f"Notion write error {r.status_code}"
+        return f"✅ Notion: «{title}»"
     except Exception as e:
-        return f"Notion write: {e}"
+        return f"Notion: {e}"
 
 
 def ensure_connected(server_id: str) -> dict:
@@ -425,13 +370,8 @@ def ensure_connected(server_id: str) -> dict:
     if not meta:
         raise ValueError(f"Сервер '{server_id}' не найден")
     if server_id == "notion" and not env("NOTION_API_KEY"):
-        raise ValueError("Notion: нет NOTION_API_KEY на сервере")
-    cs = {
-        "id": server_id,
-        "name": meta["name"],
-        "tools": TOOL_MAP.get(server_id, []),
-        "price_cents": meta.get("price_cents_per_call", 0),
-    }
+        raise ValueError("Notion: нет ключа")
+    cs = {"id": server_id, "name": meta["name"], "tools": TOOL_MAP.get(server_id, []), "price_cents": meta.get("price_cents_per_call", 0)}
     _connected[server_id] = cs
     return cs
 
@@ -439,45 +379,40 @@ def ensure_connected(server_id: str) -> dict:
 async def call_tool(server_id: str, name: str, args: dict | None = None) -> Any:
     args = args or {}
     if server_id not in _connected:
-        raise RuntimeError(f"Коннектор «{server_id}» не подключён")
+        raise RuntimeError(f"Не подключён: {server_id}")
     cents = SERVER_META.get(server_id, {}).get("price_cents_per_call", 0) or 0
     try:
         if server_id == "weather" and name == "get_weather":
-            out = tool_weather(args.get("city", "Moscow"))
+            out = weather_payload(args.get("city", "Moscow"))
         elif server_id == "weather" and name == "list_supported_cities":
-            out = ["Moscow", "London", "Tokyo", "Berlin"]
+            out = ["Moscow", "SPb", "London", "Tokyo", "Berlin"]
         elif server_id == "paid-tools" and name == "generate_slogan":
             out = tool_slogan(args.get("product", "Nexus"), args.get("tone", "professional"))
         elif server_id == "paid-tools" and name == "analyze_sentiment":
-            out = tool_sentiment(args.get("text", ""))
+            t = (args.get("text") or "").lower()
+            out = {"label": "neutral", "score": 0.5}
+            if any(w in t for w in ("хорошо", "супер", "love")):
+                out = {"label": "positive", "score": 0.8}
+            if any(w in t for w in ("плохо", "ужас", "hate")):
+                out = {"label": "negative", "score": 0.8}
         elif server_id == "paid-tools" and name == "word_count":
             t = args.get("text", "")
             out = {"words": len(t.split()), "chars": len(t)}
         elif server_id == "local-booking" and name == "search_business":
             out = tool_search_business(args.get("query", ""), args.get("city", "Москва"))
         elif server_id == "local-booking" and name == "book_service":
-            out = await tool_book(
-                args.get("business_id", "b1"),
-                args.get("service", "услуга"),
-                args.get("slot", "15:00"),
-                args.get("customer_name", "Гость"),
-            )
+            out = await tool_book(args.get("business_id", "b1"), args.get("service", "услуга"), args.get("slot", "15:00"), args.get("customer_name", "Гость"))
         elif server_id == "local-booking" and name == "list_my_bookings":
-            out = (
-                "Броней пока нет."
-                if not _bookings
-                else "\n".join(f"• {b['id']}: {b['business']} — {b['service']} в {b['slot']}" for b in _bookings)
-            )
+            out = _bookings[-20:]
         elif server_id == "local-booking" and name == "order_food_demo":
-            out = f"🍽 Демо-заказ принят: «{args.get('dish', 'суши')}» → {args.get('address', 'домой')}."
+            out = {"ok": True, "dish": args.get("dish", "суши"), "address": args.get("address", "домой"), "demo": True}
         elif server_id == "local-booking" and name == "call_taxi_demo":
-            out = f"🚕 Демо: такси {args.get('from_place', 'здесь')} → {args.get('to_place', 'дом')}."
+            out = {"ok": True, "from": args.get("from_place", "здесь"), "to": args.get("to_place", "дом"), "demo": True}
         elif server_id == "geo-ru" and name == "find_best_places":
             out = tool_geo(args.get("query", ""), args.get("city", "Москва"), float(args.get("min_rating", 4.5)))
         elif server_id == "geo-ru" and name == "place_details":
             pid = args.get("place_id", "")
-            p = next((x for x in GEO_PLACES if x["id"] == pid), None)
-            out = json.dumps(p, ensure_ascii=False, indent=2) if p else f"Место {pid} не найдено."
+            out = next((x for x in GEO_PLACES if x["id"] == pid), {"error": "not found"})
         elif server_id == "notion" and name == "notion_search":
             out = await tool_notion_search(args.get("query", ""))
         elif server_id == "notion" and name == "notion_add_row":
@@ -485,8 +420,7 @@ async def call_tool(server_id: str, name: str, args: dict | None = None) -> Any:
         elif server_id == "notion" and name == "notion_status":
             out = {"configured": bool(env("NOTION_API_KEY")), "database": bool(env("NOTION_DATABASE_ID"))}
         else:
-            raise RuntimeError(f"Unknown tool {server_id}/{name}")
-
+            raise RuntimeError(f"Unknown {server_id}/{name}")
         _usage["total_calls"] += 1
         _usage["successful_calls"] += 1
         _usage["total_revenue_usd"] += cents / 100.0
@@ -498,43 +432,55 @@ async def call_tool(server_id: str, name: str, args: dict | None = None) -> Any:
         raise
 
 
-PROVIDERS = ("groq", "grok", "openrouter")
+# ---------- LLM ----------
+PROVIDERS = ("openrouter", "groq", "grok")
+SYSTEM_PROMPT = (
+    "Ты Nexus — ИИ-агент для жизни и бизнеса в России. "
+    "Отвечай кратко, по делу, на русском. "
+    "Можешь обсуждать погоду, быт, бизнес, продуктивность, Notion. "
+    "Не выдумывай точные градусы/рейтинги, если нет данных tool — скажи что нужны актуальные API."
+)
 
 
 def provider_status() -> dict:
     return {
+        "openrouter": bool(env("OPENROUTER_API_KEY")),
         "groq": bool(env("GROQ_API_KEY")),
         "grok": bool(env("GROK_API_KEY") or _settings.get("grok_api_key")),
-        "openrouter": bool(env("OPENROUTER_API_KEY")),
-        "active": _settings.get("llm_provider") or env("LLM_PROVIDER", "groq") or "groq",
+        "active": _settings.get("llm_provider") or env("LLM_PROVIDER", "openrouter") or "openrouter",
         "supabase": supa.ok,
         "notion": bool(env("NOTION_API_KEY")),
     }
 
 
 async def call_llm(provider: str, msg: str) -> str | None:
-    system = (
-        "Ты Nexus — ИИ-агент для жизни и бизнеса в России. "
-        "Отвечай кратко и по делу на русском. "
-        "Умеешь: погода, бронь, такси, еда, слоганы, поиск мест, Notion."
-    )
-    provider = (provider or "groq").lower().strip()
+    provider = (provider or "openrouter").lower().strip()
+    messages = [{"role": "system", "content": SYSTEM_PROMPT}, {"role": "user", "content": msg}]
+    c = await http()
+
+    if provider == "openrouter" and env("OPENROUTER_API_KEY"):
+        try:
+            r = await c.post(
+                "https://openrouter.ai/api/v1/chat/completions",
+                headers={"Authorization": f"Bearer {env('OPENROUTER_API_KEY')}", "Content-Type": "application/json"},
+                json={"model": env("OPENROUTER_MODEL", "meta-llama/llama-3.1-8b-instruct:free"), "messages": messages},
+            )
+            if r.status_code < 400:
+                text = ((r.json().get("choices") or [{}])[0].get("message") or {}).get("content") or ""
+                return text.strip() or None
+        except Exception:
+            pass
 
     if provider == "groq" and env("GROQ_API_KEY"):
         try:
-            async with httpx.AsyncClient(timeout=45.0) as client:
-                r = await client.post(
-                    "https://api.groq.com/openai/v1/chat/completions",
-                    headers={"Authorization": f"Bearer {env('GROQ_API_KEY')}", "Content-Type": "application/json"},
-                    json={
-                        "model": env("GROQ_MODEL", "llama-3.3-70b-versatile"),
-                        "messages": [{"role": "system", "content": system}, {"role": "user", "content": msg}],
-                        "temperature": 0.4,
-                    },
-                )
-                if r.status_code < 400:
-                    text = ((r.json().get("choices") or [{}])[0].get("message") or {}).get("content") or ""
-                    return text.strip() or None
+            r = await c.post(
+                "https://api.groq.com/openai/v1/chat/completions",
+                headers={"Authorization": f"Bearer {env('GROQ_API_KEY')}", "Content-Type": "application/json"},
+                json={"model": env("GROQ_MODEL", "llama-3.3-70b-versatile"), "messages": messages, "temperature": 0.4},
+            )
+            if r.status_code < 400:
+                text = ((r.json().get("choices") or [{}])[0].get("message") or {}).get("content") or ""
+                return text.strip() or None
         except Exception:
             pass
 
@@ -542,228 +488,68 @@ async def call_llm(provider: str, msg: str) -> str | None:
         key = (_settings.get("grok_api_key") or env("GROK_API_KEY")).strip()
         if key:
             try:
-                async with httpx.AsyncClient(timeout=45.0) as client:
-                    r = await client.post(
-                        "https://api.x.ai/v1/chat/completions",
-                        headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
-                        json={
-                            "model": env("GROK_MODEL", "grok-2-latest"),
-                            "messages": [{"role": "system", "content": system}, {"role": "user", "content": msg}],
-                            "temperature": 0.4,
-                        },
-                    )
-                    if r.status_code < 400:
-                        text = ((r.json().get("choices") or [{}])[0].get("message") or {}).get("content") or ""
-                        return text.strip() or None
-            except Exception:
-                pass
-
-    if provider == "openrouter" and env("OPENROUTER_API_KEY"):
-        try:
-            async with httpx.AsyncClient(timeout=45.0) as client:
-                r = await client.post(
-                    "https://openrouter.ai/api/v1/chat/completions",
-                    headers={
-                        "Authorization": f"Bearer {env('OPENROUTER_API_KEY')}",
-                        "Content-Type": "application/json",
-                    },
-                    json={
-                        "model": env("OPENROUTER_MODEL", "meta-llama/llama-3.1-8b-instruct:free"),
-                        "messages": [{"role": "system", "content": system}, {"role": "user", "content": msg}],
-                    },
+                r = await c.post(
+                    "https://api.x.ai/v1/chat/completions",
+                    headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
+                    json={"model": env("GROK_MODEL", "grok-2-latest"), "messages": messages, "temperature": 0.4},
                 )
                 if r.status_code < 400:
                     text = ((r.json().get("choices") or [{}])[0].get("message") or {}).get("content") or ""
                     return text.strip() or None
-        except Exception:
-            pass
-
+            except Exception:
+                pass
     return None
 
 
-async def call_llm_with_fallback(msg: str) -> tuple[str | None, str]:
-    preferred = (_settings.get("llm_provider") or env("LLM_PROVIDER", "groq") or "groq").lower()
-    order = [preferred] + [p for p in ("groq", "openrouter", "grok") if p != preferred]
+async def call_llm_with_fallback(msg: str) -> tuple[str | None, str, str | None]:
+    """returns text, used_provider, fallback_from"""
+    preferred = (_settings.get("llm_provider") or env("LLM_PROVIDER") or "openrouter").lower()
+    if preferred not in PROVIDERS:
+        preferred = "openrouter"
+    order = [preferred] + [p for p in ("openrouter", "groq", "grok") if p != preferred]
+    first = order[0]
     for p in order:
         text = await call_llm(p, msg)
         if text:
-            return text, p
-    return None, preferred
+            return text, p, (None if p == first else first)
+    return None, preferred, None
 
 
-async def run_keyword_agent(msg: str) -> tuple[str, list[dict]]:
-    lower = msg.lower()
-    reply_parts: list[str] = []
-    tools_used: list[dict] = []
-
-    m_prov = re.search(r"(?:провайдер|provider|use|используй)\s+(groq|grok|openrouter|клод|claude)", lower)
-    if m_prov or lower.strip() in ("какой провайдер", "which provider", "провайдер?"):
-        if m_prov:
-            raw = m_prov.group(1)
-            prov = {"клод": "openrouter", "claude": "openrouter"}.get(raw, raw)
-            if prov not in PROVIDERS:
-                prov = "groq"
-            st = provider_status()
-            if not st.get(prov):
-                reply_parts.append(f"Провайдер «{prov}» не настроен (нет ключа в Railway). Сейчас: {st['active']}")
-            else:
-                _settings["llm_provider"] = prov
-                await save_settings_to_db()
-                reply_parts.append(f"✅ Провайдер LLM: **{prov}**")
-        else:
-            st = provider_status()
-            flags = ", ".join(f"{k}{'✅' if v else '❌'}" for k, v in st.items() if k in PROVIDERS)
-            reply_parts.append(f"Активный: **{st['active']}**\nДоступны: {flags}")
-        return "\n".join(reply_parts), tools_used
-
-    if any(w in lower for w in ("погод", "weather", "температур")):
-        city = "Moscow"
-        cities = {
-            "москв": "Moscow", "moscow": "Moscow", "лондон": "London", "london": "London",
-            "токио": "Tokyo", "tokyo": "Tokyo", "берлин": "Berlin", "berlin": "Berlin",
-            "петербург": "СПб", "спб": "СПб",
-        }
-        for k, v in cities.items():
-            if k in lower:
-                city = v
-                break
-        ensure_connected("weather")
-        try:
-            text = await call_tool("weather", "get_weather", {"city": city})
-            reply_parts.append(f"🌤 {text}")
-            tools_used.append({"server_id": "weather", "name": "get_weather", "ok": True})
-        except Exception as e:
-            reply_parts.append(f"❌ Погода: {e}")
-            tools_used.append({"server_id": "weather", "name": "get_weather", "ok": False, "error": str(e)})
-
-    if any(w in lower for w in ("слоган", "slogan", "tagline", "генерир")):
-        product = "Nexus"
-        m = re.search(r"(?:для|for)\s+(.+?)(?:\s+тон|\s+tone|$)", msg, re.I)
-        if m:
-            product = m.group(1).strip(" .,\"'")
-        tone = "professional"
-        if any(w in lower for w in ("смешн", "funny")):
-            tone = "funny"
-        elif any(w in lower for w in ("эмоц", "emotional")):
-            tone = "emotional"
-        elif any(w in lower for w in ("люкс", "luxury", "премиум")):
-            tone = "luxury"
-        ensure_connected("paid-tools")
-        try:
-            text = await call_tool("paid-tools", "generate_slogan", {"product": product, "tone": tone})
-            reply_parts.append(f"✨ Слоган ({tone}):\n\n«{text}»")
-            tools_used.append({"server_id": "paid-tools", "name": "generate_slogan", "ok": True})
-        except Exception as e:
-            reply_parts.append(f"❌ Слоган: {e}")
-
-    if any(w in lower for w in ("notion", "ноушн", "запиши в notion", "найди в notion")):
-        ensure_connected("notion")
-        try:
-            if any(w in lower for w in ("запиши", "добав", "add", "создай")):
-                title = msg
-                for p in ("запиши в notion", "добавь в notion", "создай в notion", "notion"):
-                    title = re.sub(p, "", title, flags=re.I).strip(" :—-")
-                text = await call_tool("notion", "notion_add_row", {"title": title or "Заметка Nexus", "note": msg})
-                tools_used.append({"server_id": "notion", "name": "notion_add_row", "ok": True})
-            else:
-                text = await call_tool("notion", "notion_search", {"query": msg})
-                tools_used.append({"server_id": "notion", "name": "notion_search", "ok": True})
-            reply_parts.append(str(text))
-        except Exception as e:
-            reply_parts.append(f"❌ Notion: {e}")
-
-    if any(w in lower for w in ("лучш", "рейтинг", "отзыв", "рядом", "найди ", "где ", "2гис", "яндекс")):
-        ensure_connected("geo-ru")
-        min_r = 4.5
-        mrat = re.search(r"(\d[.,]\d)", lower)
-        if mrat:
-            min_r = float(mrat.group(1).replace(",", "."))
-        try:
-            text = await call_tool("geo-ru", "find_best_places", {"query": msg, "city": "Москва", "min_rating": min_r})
-            reply_parts.append(text)
-            tools_used.append({"server_id": "geo-ru", "name": "find_best_places", "ok": True})
-        except Exception as e:
-            reply_parts.append(f"❌ Гео: {e}")
-
-    life_words = (
-        "маникюр", "педикюр", "салон", "стрижк", "барбер", "ресторан", "столик",
-        "заброн", "такси", "суши", "еду", "еда", "бронь", "записи", "пицц",
-    )
-    if any(w in lower for w in life_words):
-        ensure_connected("local-booking")
-        try:
-            if "такси" in lower:
-                text = await call_tool("local-booking", "call_taxi_demo", {"from_place": "здесь", "to_place": "дом"})
-                reply_parts.append(text)
-                tools_used.append({"server_id": "local-booking", "name": "call_taxi_demo", "ok": True})
-            elif any(w in lower for w in ("суши", "еду", "еда", "пицц", "заказ")):
-                dish = "суши"
-                for d in ("суши", "пицца", "бургер", "роллы"):
-                    if d in lower:
-                        dish = d
-                        break
-                text = await call_tool("local-booking", "order_food_demo", {"dish": dish, "address": "домой"})
-                reply_parts.append(text)
-                tools_used.append({"server_id": "local-booking", "name": "order_food_demo", "ok": True})
-            elif any(w in lower for w in ("мои брон", "мои запис", "брони")):
-                text = await call_tool("local-booking", "list_my_bookings", {})
-                reply_parts.append(text)
-                tools_used.append({"server_id": "local-booking", "name": "list_my_bookings", "ok": True})
-            else:
-                q = (
-                    "маникюр"
-                    if any(w in lower for w in ("маникюр", "педикюр"))
-                    else (
-                        "стрижка"
-                        if any(w in lower for w in ("стрижк", "барбер"))
-                        else ("ресторан" if any(w in lower for w in ("ресторан", "столик")) else msg[:80])
-                    )
-                )
-                text = await call_tool("local-booking", "search_business", {"query": q, "city": "Москва"})
-                reply_parts.append(text)
-                reply_parts.append("\n\nЧтобы забронировать: «забронируй b1 маникюр 15:00».")
-                tools_used.append({"server_id": "local-booking", "name": "search_business", "ok": True})
-                m_book = re.search(r"\b(b\d+)\b.*?(\d{1,2}:\d{2})", lower)
-                if m_book or ("заброн" in lower and "b" in lower):
-                    bid = m_book.group(1) if m_book else "b1"
-                    slot = m_book.group(2) if m_book else "15:00"
-                    svc = "маникюр" if "маникюр" in lower else ("стрижка" if "стрижк" in lower else "услуга")
-                    text2 = await call_tool(
-                        "local-booking",
-                        "book_service",
-                        {"business_id": bid, "service": svc, "slot": slot},
-                    )
-                    reply_parts.append("\n" + text2)
-                    tools_used.append({"server_id": "local-booking", "name": "book_service", "ok": True})
-        except Exception as e:
-            reply_parts.append(f"❌ Бытовая услуга: {e}")
-
-    if not reply_parts:
-        connected = list(_connected.values())
-        lines = [f"• {c['name']}: {', '.join(c['tools'])}" for c in connected] or [
-            "• пока нет коннекторов — нажмите ✦ Демо"
-        ]
+async def handle_provider_command(msg: str) -> str | None:
+    lower = msg.lower().strip()
+    m = re.search(r"(?:провайдер|provider|use|используй)\s+(openrouter|groq|grok|клод|claude)", lower)
+    if m:
+        raw = m.group(1)
+        prov = {"клод": "openrouter", "claude": "openrouter"}.get(raw, raw)
         st = provider_status()
-        reply_parts.append("Я Nexus MCP Agent.\n" + "\n".join(lines))
-        reply_parts.append(
-            f"\nLLM: **{st['active']}** · Supabase: {'✅' if st['supabase'] else '○'} · Notion: {'✅' if st['notion'] else '○'}"
-        )
-        reply_parts.append(
-            "\n\nПопробуйте:\n• «Какая погода в Токио?»\n• «Сгенерируй слоган для эко-кофе»\n"
-            "• «Найди маникюр с рейтингом от 4.5»\n• «Закажи такси домой»\n"
-            "• «провайдер groq» / «провайдер openrouter»\n• «найди в notion …»"
-        )
+        if not st.get(prov):
+            return f"Провайдер «{prov}» не настроен (нет ключа). Сейчас: {st['active']}"
+        _settings["llm_provider"] = prov
+        await save_settings_to_db()
+        return f"✅ Провайдер LLM: **{prov}**"
+    if lower in ("какой провайдер", "which provider", "провайдер?"):
+        st = provider_status()
+        flags = ", ".join(f"{k}{'✅' if st[k] else '❌'}" for k in PROVIDERS)
+        return f"Активный: **{st['active']}**\n{flags}"
+    return None
 
-    return "\n".join(reply_parts), tools_used
 
-
+# ---------- models (UI-ready) ----------
 class ChatRequest(BaseModel):
     message: str = Field(..., min_length=1, max_length=4000)
+    session_id: str | None = None
 
 
 class ChatResponse(BaseModel):
     reply: str
     tools_used: list[dict[str, Any]] = []
+    # for animated frontend
+    request_id: str = ""
+    latency_ms: int = 0
+    provider_used: str | None = None
+    fallback_from: str | None = None
+    cards: list[dict[str, Any]] = []
+    ui: dict[str, Any] = {}
 
 
 class SettingsBody(BaseModel):
@@ -783,14 +569,12 @@ class EmailVerify(BaseModel):
     code: str
 
 
+# ---------- routes ----------
 @app.get("/", response_class=HTMLResponse)
 async def root():
-    return f"""<!DOCTYPE html><html><head><title>Nexus MCP</title>
-    <style>body{{font-family:system-ui;background:#0a0a0a;color:#fff;text-align:center;padding:50px}}
-    h1{{color:#00ff88}}</style></head><body>
-    <h1>Nexus MCP Backend</h1><p style="color:#00ff88">v{APP_VERSION}</p>
-    <p><a href="/docs" style="color:#7dd3fc">/docs</a> · <a href="/api/health" style="color:#7dd3fc">/api/health</a></p>
-    </body></html>"""
+    return f"""<!DOCTYPE html><html><body style="font-family:system-ui;background:#0a0a0a;color:#fff;text-align:center;padding:48px">
+    <h1 style="color:#00ff88">Nexus MCP</h1><p>v{APP_VERSION}</p>
+    <p><a href="/docs" style="color:#7dd3fc">/docs</a> · <a href="/api/health" style="color:#7dd3fc">/api/health</a></p></body></html>"""
 
 
 @app.get("/api/health")
@@ -803,11 +587,12 @@ async def health():
         "version": APP_VERSION,
         "connected": list(_connected.keys()),
         "llm_provider": st["active"],
+        "openrouter_configured": st["openrouter"],
         "groq_configured": st["groq"],
         "grok_configured": st["grok"],
-        "openrouter_configured": st["openrouter"],
         "supabase": st["supabase"],
         "notion": st["notion"],
+        "ui_contract": "chat.cards+ui+latency_ms",
     }
 
 
@@ -824,24 +609,14 @@ async def catalog():
 @app.get("/api/connected")
 async def list_connected():
     return [
-        {
-            "id": c["id"],
-            "name": c["name"],
-            "tools_count": len(c["tools"]),
-            "tools": c["tools"],
-            "price_cents": c.get("price_cents", 0),
-        }
+        {"id": c["id"], "name": c["name"], "tools_count": len(c["tools"]), "tools": c["tools"], "price_cents": c.get("price_cents", 0)}
         for c in _connected.values()
     ]
 
 
 @app.get("/api/tools")
 async def list_tools():
-    out = []
-    for c in _connected.values():
-        for t in c["tools"]:
-            out.append({"name": t, "server_id": c["id"], "server_name": c["name"]})
-    return out
+    return [{"name": t, "server_id": c["id"], "server_name": c["name"]} for c in _connected.values() for t in c["tools"]]
 
 
 @app.get("/api/usage")
@@ -853,13 +628,7 @@ async def get_usage():
 async def connect_server(server_id: str):
     try:
         cs = ensure_connected(server_id)
-        return {
-            "ok": True,
-            "id": cs["id"],
-            "name": cs["name"],
-            "tools": cs["tools"],
-            "price_cents": cs.get("price_cents", 0),
-        }
+        return {"ok": True, "id": cs["id"], "name": cs["name"], "tools": cs["tools"], "price_cents": cs.get("price_cents", 0)}
     except ValueError as e:
         raise HTTPException(400, str(e))
 
@@ -871,34 +640,66 @@ async def disconnect_server(server_id: str):
 
 
 @app.post("/api/chat", response_model=ChatResponse)
-async def chat(req: ChatRequest):
+async def chat(req: ChatRequest, request: Request):
+    t0 = time.time()
+    rid = str(uuid.uuid4())[:8]
     msg = req.message.strip()
     if not msg:
         raise HTTPException(400, "Пустое сообщение")
 
-    lower = msg.lower()
-    actionable = any(
-        w in lower
-        for w in (
-            "погод", "weather", "слоган", "маникюр", "такси", "суши", "салон", "ресторан",
-            "бронь", "найди", "рейтинг", "стрижк", "еду", "еда", "пицц", "генерир",
-            "провайдер", "provider", "use ", "используй", "notion", "ноушн",
+    ip = request.client.host if request.client else "unknown"
+    if not rate_ok(ip):
+        raise HTTPException(429, "Слишком много запросов, подождите минуту")
+
+    # system command only
+    prov_reply = await handle_provider_command(msg)
+    if prov_reply:
+        latency = int((time.time() - t0) * 1000)
+        await persist_message("user", msg)
+        await persist_message("assistant", prov_reply, [])
+        return ChatResponse(
+            reply=prov_reply,
+            tools_used=[],
+            request_id=rid,
+            latency_ms=latency,
+            provider_used=None,
+            cards=[],
+            ui={"motion": "fade", "typing_ms": 0, "tone": "system"},
         )
-    )
 
-    if actionable:
-        reply, tools_used = await run_keyword_agent(msg)
+    # LLM-first (OpenRouter base)
+    text, used, fb = await call_llm_with_fallback(msg)
+    tools_used: list[dict] = []
+    cards: list[dict] = []
+
+    if text:
+        tools_used = [{"server_id": "llm", "name": used, "ok": True}]
+        reply = text
     else:
-        text, used_provider = await call_llm_with_fallback(msg)
-        if text:
-            reply = text
-            tools_used = [{"server_id": "llm", "name": used_provider, "ok": True}]
-        else:
-            reply, tools_used = await run_keyword_agent(msg)
+        reply = "Нейросеть не ответила. Проверьте OPENROUTER_API_KEY или напишите: провайдер groq"
+        tools_used = [{"server_id": "llm", "name": "none", "ok": False}]
+        used = None
 
+    latency = int((time.time() - t0) * 1000)
     await persist_message("user", msg)
     await persist_message("assistant", reply, tools_used)
-    return ChatResponse(reply=reply, tools_used=tools_used)
+
+    return ChatResponse(
+        reply=reply,
+        tools_used=tools_used,
+        request_id=rid,
+        latency_ms=latency,
+        provider_used=used,
+        fallback_from=fb,
+        cards=cards,
+        ui={
+            "motion": "slide-up",
+            "typing_ms": min(1200, max(200, latency // 2)),
+            "tone": "assistant",
+            "show_provider_chip": True,
+            "animate_markdown": True,
+        },
+    )
 
 
 @app.get("/api/packs")
@@ -931,7 +732,6 @@ async def activate_pack(pack_id: str):
 
 @app.post("/api/demo/activate")
 async def activate_demo():
-    _settings["demo_mode"] = True
     connected = []
     for sid in ("weather", "paid-tools", "local-booking", "geo-ru"):
         ensure_connected(sid)
@@ -966,10 +766,8 @@ async def save_settings(body: SettingsBody):
         _settings["demo_mode"] = body.demo_mode
     if body.display_name is not None:
         _settings["display_name"] = body.display_name
-    if body.llm_provider is not None:
-        p = body.llm_provider.lower().strip()
-        if p in PROVIDERS:
-            _settings["llm_provider"] = p
+    if body.llm_provider is not None and body.llm_provider.lower().strip() in PROVIDERS:
+        _settings["llm_provider"] = body.llm_provider.lower().strip()
     await save_settings_to_db()
     return {"ok": True}
 
@@ -996,7 +794,7 @@ async def business_register(body: dict):
         raise HTTPException(400, "Укажите название")
     _business_apps.append(row)
     await supa.insert("business_apps", row)
-    return {"ok": True, "message": "Заявка принята. После модерации бизнес появится в каталоге.", "item": row}
+    return {"ok": True, "message": "Заявка принята", "item": row}
 
 
 @app.get("/api/business/list")
@@ -1009,14 +807,14 @@ async def business_list():
 async def auth_email_start(body: EmailStart):
     code = f"{secrets.randbelow(900000) + 100000}"
     _auth_codes[body.email.lower()] = code
-    return {"ok": True, "message": "Код отправлен (demo)", "demo_code": code}
+    return {"ok": True, "message": "Код (demo)", "demo_code": code}
 
 
 @app.post("/api/auth/email/verify")
 async def auth_email_verify(body: EmailVerify):
     expected = _auth_codes.get(body.email.lower())
     if not expected or expected != body.code.strip():
-        raise HTTPException(400, "Неверный или просроченный код")
+        raise HTTPException(400, "Неверный код")
     token = secrets.token_urlsafe(24)
     _sessions[token] = {"email": body.email, "ts": time.time()}
     _settings["display_name"] = body.email.split("@")[0]
@@ -1044,6 +842,8 @@ async def clear_history():
 @app.on_event("startup")
 async def startup():
     await load_settings_from_db()
+    if not _settings.get("llm_provider"):
+        _settings["llm_provider"] = env("LLM_PROVIDER", "openrouter") or "openrouter"
     for sid in ("weather", "local-booking", "geo-ru", "paid-tools"):
         try:
             ensure_connected(sid)
@@ -1056,7 +856,14 @@ async def startup():
             pass
 
 
+@app.on_event("shutdown")
+async def shutdown():
+    global _http
+    if _http is not None:
+        await _http.aclose()
+        _http = None
+
+
 if __name__ == "__main__":
     import uvicorn
-
     uvicorn.run("api.server:app", host="0.0.0.0", port=int(os.getenv("PORT", "8080")))
