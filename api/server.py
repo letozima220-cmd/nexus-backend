@@ -4,6 +4,7 @@ Nexus MCP Backend v2.0.0
 - Structured chat responses for rich animated UI
 - Supabase + Notion + multi-provider fallback
 - request_id, latency_ms, cards, ui hints
+- provider from frontend (auto / openrouter / groq / grok)
 """
 from __future__ import annotations
 
@@ -501,9 +502,9 @@ async def call_llm(provider: str, msg: str) -> str | None:
     return None
 
 
-async def call_llm_with_fallback(msg: str) -> tuple[str | None, str, str | None]:
+async def call_llm_with_fallback(msg: str, preferred: str | None = None) -> tuple[str | None, str, str | None]:
     """returns text, used_provider, fallback_from"""
-    preferred = (_settings.get("llm_provider") or env("LLM_PROVIDER") or "openrouter").lower()
+    preferred = (preferred or _settings.get("llm_provider") or env("LLM_PROVIDER") or "openrouter").lower().strip()
     if preferred not in PROVIDERS:
         preferred = "openrouter"
     order = [preferred] + [p for p in ("openrouter", "groq", "grok") if p != preferred]
@@ -538,12 +539,12 @@ async def handle_provider_command(msg: str) -> str | None:
 class ChatRequest(BaseModel):
     message: str = Field(..., min_length=1, max_length=4000)
     session_id: str | None = None
+    provider: str | None = None
 
 
 class ChatResponse(BaseModel):
     reply: str
     tools_used: list[dict[str, Any]] = []
-    # for animated frontend
     request_id: str = ""
     latency_ms: int = 0
     provider_used: str | None = None
@@ -667,8 +668,13 @@ async def chat(req: ChatRequest, request: Request):
             ui={"motion": "fade", "typing_ms": 0, "tone": "system"},
         )
 
-    # LLM-first (OpenRouter base)
-    text, used, fb = await call_llm_with_fallback(msg)
+    # LLM-first (provider с фронта или из settings)
+    req_provider = (req.provider or "").lower().strip() or None
+    if req_provider == "auto":
+        req_provider = None
+    if req_provider and req_provider not in PROVIDERS:
+        req_provider = None
+    text, used, fb = await call_llm_with_fallback(msg, preferred=req_provider)
     tools_used: list[dict] = []
     cards: list[dict] = []
 
@@ -676,7 +682,7 @@ async def chat(req: ChatRequest, request: Request):
         tools_used = [{"server_id": "llm", "name": used, "ok": True}]
         reply = text
     else:
-        reply = "Нейросеть не ответила. Проверьте OPENROUTER_API_KEY или напишите: провайдер groq"
+        reply = "Нейросеть не ответила. Проверьте OPENROUTER_API_KEY / GROQ_API_KEY / GROK_API_KEY или напишите: провайдер groq"
         tools_used = [{"server_id": "llm", "name": "none", "ok": False}]
         used = None
 
