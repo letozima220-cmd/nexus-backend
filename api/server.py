@@ -1,6 +1,6 @@
 """
-Nexus MCP Backend v2.0.0
-- OpenRouter-first LLM
+Nexus MCP Backend v2.1.0
+- OpenRouter-first LLM + tool-calling
 - Structured chat responses for rich animated UI
 - Supabase + Notion + multi-provider fallback
 - request_id, latency_ms, cards, ui hints
@@ -23,7 +23,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse
 from pydantic import BaseModel, Field
 
-APP_VERSION = "2.0.0"
+APP_VERSION = "2.1.0"
 USER_ID = "web_user"
 
 app = FastAPI(title="Nexus MCP Backend", version=APP_VERSION)
@@ -122,6 +122,218 @@ TOOL_MAP = {
     "local-booking": ["search_business", "book_service", "list_my_bookings", "order_food_demo", "call_taxi_demo"],
     "geo-ru": ["find_best_places", "place_details"],
     "notion": ["notion_search", "notion_add_row", "notion_status"],
+}
+
+# OpenAI-compatible tools schema
+TOOLS = [
+    {
+        "type": "function",
+        "function": {
+            "name": "get_weather",
+            "description": "Получить погоду по городу",
+            "parameters": {
+                "type": "object",
+                "properties": {"city": {"type": "string", "description": "Город"}},
+                "required": ["city"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "list_supported_cities",
+            "description": "Список городов с демо-погодой",
+            "parameters": {"type": "object", "properties": {}},
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "search_business",
+            "description": "Найти салон/ресторан/барбершоп",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string"},
+                    "city": {"type": "string", "default": "Москва"},
+                },
+                "required": ["query"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "book_service",
+            "description": "Забронировать услугу",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "business_id": {"type": "string"},
+                    "service": {"type": "string"},
+                    "slot": {"type": "string"},
+                    "customer_name": {"type": "string", "default": "Гость"},
+                },
+                "required": ["business_id", "service", "slot"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "list_my_bookings",
+            "description": "Список моих броней",
+            "parameters": {"type": "object", "properties": {}},
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "order_food_demo",
+            "description": "Демо-заказ еды",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "dish": {"type": "string"},
+                    "address": {"type": "string", "default": "домой"},
+                },
+                "required": ["dish"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "call_taxi_demo",
+            "description": "Демо-вызов такси",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "from_place": {"type": "string", "default": "здесь"},
+                    "to_place": {"type": "string", "default": "дом"},
+                },
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "find_best_places",
+            "description": "Найти лучшие места по отзывам",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string"},
+                    "city": {"type": "string", "default": "Москва"},
+                    "min_rating": {"type": "number", "default": 4.5},
+                },
+                "required": ["query"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "place_details",
+            "description": "Детали места по id",
+            "parameters": {
+                "type": "object",
+                "properties": {"place_id": {"type": "string"}},
+                "required": ["place_id"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "generate_slogan",
+            "description": "Сгенерировать слоган",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "product": {"type": "string"},
+                    "tone": {"type": "string", "enum": ["professional", "funny", "emotional", "luxury"], "default": "professional"},
+                },
+                "required": ["product"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "analyze_sentiment",
+            "description": "Анализ тональности текста",
+            "parameters": {
+                "type": "object",
+                "properties": {"text": {"type": "string"}},
+                "required": ["text"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "word_count",
+            "description": "Подсчёт слов и символов",
+            "parameters": {
+                "type": "object",
+                "properties": {"text": {"type": "string"}},
+                "required": ["text"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "notion_search",
+            "description": "Поиск в Notion",
+            "parameters": {
+                "type": "object",
+                "properties": {"query": {"type": "string"}},
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "notion_add_row",
+            "description": "Добавить запись в Notion",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "title": {"type": "string"},
+                    "note": {"type": "string"},
+                },
+                "required": ["title"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "notion_status",
+            "description": "Статус подключения Notion",
+            "parameters": {"type": "object", "properties": {}},
+        },
+    },
+]
+
+TOOL_TO_SERVER = {
+    "get_weather": "weather",
+    "list_supported_cities": "weather",
+    "search_business": "local-booking",
+    "book_service": "local-booking",
+    "list_my_bookings": "local-booking",
+    "order_food_demo": "local-booking",
+    "call_taxi_demo": "local-booking",
+    "find_best_places": "geo-ru",
+    "place_details": "geo-ru",
+    "generate_slogan": "paid-tools",
+    "analyze_sentiment": "paid-tools",
+    "word_count": "paid-tools",
+    "notion_search": "notion",
+    "notion_add_row": "notion",
+    "notion_status": "notion",
 }
 
 _connected: dict[str, dict] = {}
@@ -249,7 +461,7 @@ async def save_settings_to_db() -> None:
     )
 
 
-# ---------- tools ----------
+# ---------- tools implementation ----------
 def weather_payload(city: str) -> dict:
     key = (city or "Moscow").lower().strip()
     for k, v in WEATHER.items():
@@ -433,13 +645,31 @@ async def call_tool(server_id: str, name: str, args: dict | None = None) -> Any:
         raise
 
 
+async def execute_tool_by_name(name: str, args: dict | None = None) -> Any:
+    """Выполнить tool по имени (с авто-подключением сервера)."""
+    args = args or {}
+    server_id = TOOL_TO_SERVER.get(name)
+    if not server_id:
+        return {"error": f"Unknown tool: {name}"}
+    if server_id not in _connected:
+        try:
+            ensure_connected(server_id)
+        except Exception as e:
+            return {"error": str(e)}
+    try:
+        return await call_tool(server_id, name, args)
+    except Exception as e:
+        return {"error": str(e)}
+
+
 # ---------- LLM ----------
 PROVIDERS = ("openrouter", "groq", "grok")
 SYSTEM_PROMPT = (
     "Ты Nexus — ИИ-агент для жизни и бизнеса в России. "
     "Отвечай кратко, по делу, на русском. "
-    "Можешь обсуждать погоду, быт, бизнес, продуктивность, Notion. "
-    "Не выдумывай точные градусы/рейтинги, если нет данных tool — скажи что нужны актуальные API."
+    "Когда нужны точные данные (погода, бронь, места, слоганы, Notion) — обязательно вызывай tool. "
+    "Не выдумывай градусы, рейтинги и слоты. "
+    "После получения результата tool сформулируй понятный ответ пользователю."
 )
 
 
@@ -454,66 +684,160 @@ def provider_status() -> dict:
     }
 
 
-async def call_llm(provider: str, msg: str) -> str | None:
+def _parse_openai_response(data: dict) -> dict:
+    choice = (data.get("choices") or [{}])[0]
+    msg = choice.get("message") or {}
+    content = (msg.get("content") or "").strip() or None
+    tool_calls = []
+    for tc in msg.get("tool_calls") or []:
+        fn = tc.get("function") or {}
+        try:
+            args = json.loads(fn.get("arguments") or "{}")
+        except Exception:
+            args = {}
+        tool_calls.append({
+            "id": tc.get("id") or str(uuid.uuid4())[:8],
+            "name": fn.get("name"),
+            "arguments": args,
+        })
+    return {"content": content, "tool_calls": tool_calls or None}
+
+
+async def call_llm(provider: str, messages: list[dict], tools: list | None = None) -> dict:
+    """
+    Returns: {"content": str|None, "tool_calls": list|None}
+    """
     provider = (provider or "openrouter").lower().strip()
-    messages = [{"role": "system", "content": SYSTEM_PROMPT}, {"role": "user", "content": msg}]
     c = await http()
 
+    payload: dict[str, Any] = {
+        "messages": messages,
+        "temperature": 0.3,
+    }
+    if tools:
+        payload["tools"] = tools
+        payload["tool_choice"] = "auto"
+
+    # OpenRouter
     if provider == "openrouter" and env("OPENROUTER_API_KEY"):
+        payload["model"] = env("OPENROUTER_MODEL", "openai/gpt-4o-mini")
         try:
             r = await c.post(
                 "https://openrouter.ai/api/v1/chat/completions",
                 headers={"Authorization": f"Bearer {env('OPENROUTER_API_KEY')}", "Content-Type": "application/json"},
-                json={"model": env("OPENROUTER_MODEL", "meta-llama/llama-3.1-8b-instruct:free"), "messages": messages},
+                json=payload,
             )
             if r.status_code < 400:
-                text = ((r.json().get("choices") or [{}])[0].get("message") or {}).get("content") or ""
-                return text.strip() or None
+                return _parse_openai_response(r.json())
         except Exception:
             pass
 
+    # Groq
     if provider == "groq" and env("GROQ_API_KEY"):
+        payload["model"] = env("GROQ_MODEL", "llama-3.3-70b-versatile")
         try:
             r = await c.post(
                 "https://api.groq.com/openai/v1/chat/completions",
                 headers={"Authorization": f"Bearer {env('GROQ_API_KEY')}", "Content-Type": "application/json"},
-                json={"model": env("GROQ_MODEL", "llama-3.3-70b-versatile"), "messages": messages, "temperature": 0.4},
+                json=payload,
             )
             if r.status_code < 400:
-                text = ((r.json().get("choices") or [{}])[0].get("message") or {}).get("content") or ""
-                return text.strip() or None
+                return _parse_openai_response(r.json())
         except Exception:
             pass
 
+    # Grok
     if provider == "grok":
         key = (_settings.get("grok_api_key") or env("GROK_API_KEY")).strip()
         if key:
+            payload["model"] = env("GROK_MODEL", "grok-2-latest")
             try:
                 r = await c.post(
                     "https://api.x.ai/v1/chat/completions",
                     headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
-                    json={"model": env("GROK_MODEL", "grok-2-latest"), "messages": messages, "temperature": 0.4},
+                    json=payload,
                 )
                 if r.status_code < 400:
-                    text = ((r.json().get("choices") or [{}])[0].get("message") or {}).get("content") or ""
-                    return text.strip() or None
+                    return _parse_openai_response(r.json())
             except Exception:
                 pass
-    return None
+
+    return {"content": None, "tool_calls": None}
 
 
-async def call_llm_with_fallback(msg: str, preferred: str | None = None) -> tuple[str | None, str, str | None]:
-    """returns text, used_provider, fallback_from"""
+async def call_llm_with_tools(messages: list[dict], preferred: str | None = None) -> tuple[str, list[dict], str, str | None]:
+    """
+    Tool-calling loop.
+    Returns: (final_text, tools_used, used_provider, fallback_from)
+    """
     preferred = (preferred or _settings.get("llm_provider") or env("LLM_PROVIDER") or "openrouter").lower().strip()
     if preferred not in PROVIDERS:
         preferred = "openrouter"
+
     order = [preferred] + [p for p in ("openrouter", "groq", "grok") if p != preferred]
-    first = order[0]
-    for p in order:
-        text = await call_llm(p, msg)
-        if text:
-            return text, p, (None if p == first else first)
-    return None, preferred, None
+    tools_used: list[dict] = []
+    used_provider = preferred
+    fallback_from = None
+    max_rounds = 4
+
+    for _ in range(max_rounds):
+        result = {"content": None, "tool_calls": None}
+
+        for p in order:
+            result = await call_llm(p, messages, tools=TOOLS)
+            if result["content"] or result["tool_calls"]:
+                if p != preferred and fallback_from is None:
+                    fallback_from = preferred
+                used_provider = p
+                preferred = p  # дальше работаем с рабочим провайдером
+                order = [p] + [x for x in order if x != p]
+                break
+
+        if result["tool_calls"]:
+            # assistant message with tool_calls
+            messages.append({
+                "role": "assistant",
+                "content": result["content"],
+                "tool_calls": [
+                    {
+                        "id": tc["id"],
+                        "type": "function",
+                        "function": {
+                            "name": tc["name"],
+                            "arguments": json.dumps(tc["arguments"], ensure_ascii=False),
+                        },
+                    }
+                    for tc in result["tool_calls"]
+                ],
+            })
+
+            for tc in result["tool_calls"]:
+                out = await execute_tool_by_name(tc["name"], tc["arguments"])
+                ok = not (isinstance(out, dict) and out.get("error"))
+                tools_used.append({
+                    "server_id": TOOL_TO_SERVER.get(tc["name"], "tool"),
+                    "name": tc["name"],
+                    "ok": ok,
+                    "args": tc["arguments"],
+                })
+                messages.append({
+                    "role": "tool",
+                    "tool_call_id": tc["id"],
+                    "content": json.dumps(out, ensure_ascii=False, default=str),
+                })
+            continue
+
+        if result["content"]:
+            return result["content"], tools_used, used_provider, fallback_from
+
+        break
+
+    return (
+        "Нейросеть не ответила. Проверьте ключи OPENROUTER / GROQ / GROK или напишите: провайдер groq",
+        tools_used,
+        used_provider,
+        fallback_from,
+    )
 
 
 async def handle_provider_command(msg: str) -> str | None:
@@ -535,7 +859,7 @@ async def handle_provider_command(msg: str) -> str | None:
     return None
 
 
-# ---------- models (UI-ready) ----------
+# ---------- models ----------
 class ChatRequest(BaseModel):
     message: str = Field(..., min_length=1, max_length=4000)
     session_id: str | None = None
@@ -594,6 +918,7 @@ async def health():
         "supabase": st["supabase"],
         "notion": st["notion"],
         "ui_contract": "chat.cards+ui+latency_ms",
+        "tool_calling": True,
     }
 
 
@@ -652,7 +977,7 @@ async def chat(req: ChatRequest, request: Request):
     if not rate_ok(ip):
         raise HTTPException(429, "Слишком много запросов, подождите минуту")
 
-    # system command only
+    # system command
     prov_reply = await handle_provider_command(msg)
     if prov_reply:
         latency = int((time.time() - t0) * 1000)
@@ -668,36 +993,31 @@ async def chat(req: ChatRequest, request: Request):
             ui={"motion": "fade", "typing_ms": 0, "tone": "system"},
         )
 
-    # LLM-first (provider с фронта или из settings)
+    messages = [
+        {"role": "system", "content": SYSTEM_PROMPT},
+        {"role": "user", "content": msg},
+    ]
+
     req_provider = (req.provider or "").lower().strip() or None
     if req_provider == "auto":
         req_provider = None
     if req_provider and req_provider not in PROVIDERS:
         req_provider = None
-    text, used, fb = await call_llm_with_fallback(msg, preferred=req_provider)
-    tools_used: list[dict] = []
-    cards: list[dict] = []
 
-    if text:
-        tools_used = [{"server_id": "llm", "name": used, "ok": True}]
-        reply = text
-    else:
-        reply = "Нейросеть не ответила. Проверьте OPENROUTER_API_KEY / GROQ_API_KEY / GROK_API_KEY или напишите: провайдер groq"
-        tools_used = [{"server_id": "llm", "name": "none", "ok": False}]
-        used = None
+    text, tools_used, used, fb = await call_llm_with_tools(messages, preferred=req_provider)
 
     latency = int((time.time() - t0) * 1000)
     await persist_message("user", msg)
-    await persist_message("assistant", reply, tools_used)
+    await persist_message("assistant", text, tools_used)
 
     return ChatResponse(
-        reply=reply,
+        reply=text,
         tools_used=tools_used,
         request_id=rid,
         latency_ms=latency,
         provider_used=used,
         fallback_from=fb,
-        cards=cards,
+        cards=[],
         ui={
             "motion": "slide-up",
             "typing_ms": min(1200, max(200, latency // 2)),
